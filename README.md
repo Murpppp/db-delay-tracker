@@ -10,6 +10,16 @@ A real-time Deutsche Bahn train delay prediction system using online machine lea
 |---|---|
 | ![Overview](docs/screenshots/overview.png) | ![Station](docs/screenshots/station.png) |
 
+## Notebooks
+
+Step-by-step explanations — open with nbviewer if GitHub preview fails:
+
+| Notebook | nbviewer |
+|---|---|
+| 01 — Data & the DB API | [![nbviewer](https://raw.githubusercontent.com/jupyter/design/master/logos/Badges/nbviewer_badge.svg)](https://nbviewer.org/github/Murpppp/db-delay-tracker/blob/main/notebooks/01_data_and_api.ipynb) |
+| 02 — Feature Engineering | [![nbviewer](https://raw.githubusercontent.com/jupyter/design/master/logos/Badges/nbviewer_badge.svg)](https://nbviewer.org/github/Murpppp/db-delay-tracker/blob/main/notebooks/02_feature_engineering.ipynb) |
+| 03 — Model Training & Eval | [![nbviewer](https://raw.githubusercontent.com/jupyter/design/master/logos/Badges/nbviewer_badge.svg)](https://nbviewer.org/github/Murpppp/db-delay-tracker/blob/main/notebooks/03_model_training_and_eval.ipynb) |
+
 ## Architecture
 
 ```
