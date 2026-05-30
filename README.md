@@ -71,9 +71,9 @@ Uses River's `HoeffdingAdaptiveTreeRegressor` — an online decision tree that:
 
 | Metric | Baseline (CSV) | Live |
 |---|---|---|
-| MAE | ~5.4 min | ~2.5 min |
-| Within ±5 min | ~72% | ~88% |
-| R² | negative | ~0.4+ |
+| MAE | ~5.4 min | ~x.x min |
+| Within ±5 min | ~72% | ~xx% |
+| R² | negative | ~x.x+ |
 
 ## Setup
 
