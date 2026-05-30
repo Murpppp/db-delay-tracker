@@ -104,7 +104,11 @@ def _qdf(sql: str, params=None) -> pd.DataFrame:
 
 @st.cache_data(ttl=60)
 def fetch_overall_kpis(days: int = None) -> pd.DataFrame:
-    date_filter = f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days else ""
+    date_filter = (
+        "AND predicted_at >= CURRENT_DATE AT TIME ZONE 'Europe/Berlin'" if days == 0
+        else f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days
+        else ""
+    )
     return _qdf(f"""
         WITH deduped AS (
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
@@ -147,7 +151,11 @@ def fetch_station_summary() -> pd.DataFrame:
 
 @st.cache_data(ttl=60)
 def fetch_mae_over_time(days: int = None) -> pd.DataFrame:
-    date_filter = f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days else ""
+    date_filter = (
+        "AND predicted_at >= CURRENT_DATE AT TIME ZONE 'Europe/Berlin'" if days == 0
+        else f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days
+        else ""
+    )
     return _qdf(f"""
         WITH deduped AS (
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
@@ -184,7 +192,11 @@ def fetch_delay_dist(station_eva: str = None) -> pd.DataFrame:
 
 @st.cache_data(ttl=60)
 def fetch_station_kpis(station_eva: str, days: int = None) -> pd.DataFrame:
-    date_filter = f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days else ""
+    date_filter = (
+        "AND predicted_at >= CURRENT_DATE AT TIME ZONE 'Europe/Berlin'" if days == 0
+        else f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days
+        else ""
+    )
     return _qdf(f"""
         WITH deduped AS (
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
@@ -286,7 +298,11 @@ def fetch_next_trains(station_eva: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=60)
 def fetch_live_accuracy(days: int = None) -> pd.DataFrame:
-    date_filter = f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days else ""
+    date_filter = (
+        "AND predicted_at >= CURRENT_DATE AT TIME ZONE 'Europe/Berlin'" if days == 0
+        else f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days
+        else ""
+    )
     return _qdf(f"""
         WITH deduped AS (
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
@@ -366,8 +382,12 @@ with st.sidebar:
     st.caption(f"Updated: {datetime.now(BERLIN).strftime('%H:%M:%S')} · auto-refresh 60s")
     st.divider()
 
-    days_filter = st.radio("Evaluation window", ["Last 7 days", "All time"], index=0)
-    days = 7 if days_filter == "Last 7 days" else None
+    days_filter = st.radio(
+        "Evaluation window",
+        ["Today", "Last 7 days", "Last month", "All time"],
+        index=1,
+    )
+    days = {"Today": 0, "Last 7 days": 7, "Last month": 30, "All time": None}[days_filter]
     st.divider()
 
     options = ["🗺 All Stations"] + list(STATIONS.keys())
