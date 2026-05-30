@@ -7,9 +7,12 @@ Usage:
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
+import zoneinfo
+BERLIN = zoneinfo.ZoneInfo("Europe/Berlin")
 
 import pandas as pd
+import plotly.colors as pc
 import plotly.express as px
 import plotly.graph_objects as go
 import psycopg2
@@ -62,6 +65,8 @@ STATION_COLORS = {
     "Stuttgart Feuersee":     "#72B7B2",
     "Stuttgart Universität":  "#54A24B",
 }
+DB_DARK   = "#282D37"
+CHART_SEQ = [DB_RED, "#F0A500", "#00A878", "#0075BF", "#8B5CF6"]
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -79,6 +84,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Auto-refresh every 60 seconds
 st_autorefresh(interval=60_000, key="autorefresh")
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -97,13 +103,14 @@ def _qdf(sql: str, params=None) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
-def fetch_overall_kpis() -> pd.DataFrame:
-    return _qdf("""
+def fetch_overall_kpis(days: int = None) -> pd.DataFrame:
+    date_filter = f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days else ""
+    return _qdf(f"""
         WITH deduped AS (
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
                 predicted_delay_min, actual_delay_min
             FROM predictions
-            WHERE actual_delay_min IS NOT NULL
+            WHERE actual_delay_min IS NOT NULL {date_filter}
             ORDER BY train_id, station_eva, scheduled_arr, predicted_at DESC
         )
         SELECT
@@ -139,14 +146,15 @@ def fetch_station_summary() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
-def fetch_mae_over_time() -> pd.DataFrame:
-    return _qdf("""
+def fetch_mae_over_time(days: int = None) -> pd.DataFrame:
+    date_filter = f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days else ""
+    return _qdf(f"""
         WITH deduped AS (
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
                 predicted_delay_min, actual_delay_min,
                 TO_TIMESTAMP(FLOOR(EXTRACT(EPOCH FROM predicted_at) / 1800) * 1800) AS bucket
             FROM predictions
-            WHERE actual_delay_min IS NOT NULL
+            WHERE actual_delay_min IS NOT NULL {date_filter}
             ORDER BY train_id, station_eva, scheduled_arr, predicted_at DESC
         )
         SELECT
@@ -175,13 +183,14 @@ def fetch_delay_dist(station_eva: str = None) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
-def fetch_station_kpis(station_eva: str) -> pd.DataFrame:
-    return _qdf("""
+def fetch_station_kpis(station_eva: str, days: int = None) -> pd.DataFrame:
+    date_filter = f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days else ""
+    return _qdf(f"""
         WITH deduped AS (
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
                 predicted_delay_min, actual_delay_min
             FROM predictions
-            WHERE station_eva = %s AND actual_delay_min IS NOT NULL
+            WHERE station_eva = %s AND actual_delay_min IS NOT NULL {date_filter}
             ORDER BY train_id, station_eva, scheduled_arr, predicted_at DESC
         )
         SELECT
@@ -276,13 +285,14 @@ def fetch_next_trains(station_eva: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
-def fetch_live_accuracy() -> pd.DataFrame:
-    return _qdf("""
+def fetch_live_accuracy(days: int = None) -> pd.DataFrame:
+    date_filter = f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days else ""
+    return _qdf(f"""
         WITH deduped AS (
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
                 predicted_delay_min, actual_delay_min
             FROM predictions
-            WHERE actual_delay_min IS NOT NULL
+            WHERE actual_delay_min IS NOT NULL {date_filter}
             ORDER BY train_id, station_eva, scheduled_arr, predicted_at DESC
         ),
         mean_val AS (
@@ -315,7 +325,7 @@ def load_model_log() -> pd.DataFrame:
         if not rows:
             return pd.DataFrame()
         df = pd.DataFrame(rows)
-        df["ts"] = pd.to_datetime(df["ts"])
+        df["ts"] = pd.to_datetime(df["ts"]).dt.tz_localize("UTC").dt.tz_convert("Europe/Berlin")
         return df
     except FileNotFoundError:
         return pd.DataFrame()
@@ -353,7 +363,11 @@ def fetch_mae_by_station() -> pd.DataFrame:
 
 with st.sidebar:
     st.title("🚂 DB Delay Tracker")
-    st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')} · auto-refresh 60s")
+    st.caption(f"Updated: {datetime.now(BERLIN).strftime('%H:%M:%S')} · auto-refresh 60s")
+    st.divider()
+
+    days_filter = st.radio("Evaluation window", ["Last 7 days", "All time"], index=0)
+    days = 7 if days_filter == "Last 7 days" else None
     st.divider()
 
     options = ["🗺 All Stations"] + list(STATIONS.keys())
@@ -369,7 +383,7 @@ with st.sidebar:
 if selected == "🗺 All Stations":
     st.header("Overall Network Overview")
 
-    kpis = fetch_overall_kpis()
+    kpis = fetch_overall_kpis(days)
     r = kpis.iloc[0] if not kpis.empty else {}
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -385,9 +399,10 @@ if selected == "🗺 All Stations":
 
     st.divider()
 
+    # Model accuracy comparison
     with st.expander("Model Accuracy — Baseline vs Live", expanded=True):
         ev = load_model_eval()
-        live = fetch_live_accuracy()
+        live = fetch_live_accuracy(days)
         lr = live.iloc[0] if not live.empty else {}
 
         col_b, col_l, col_d = st.columns(3)
@@ -472,7 +487,8 @@ if selected == "🗺 All Stations":
             else:
                 st.info("No evaluated predictions yet.")
 
-        mae_df = fetch_mae_over_time()
+        # MAE over time
+        mae_df = fetch_mae_over_time(days)
         if not mae_df.empty:
             st.subheader("Model MAE over Time")
             fig3 = px.line(
@@ -487,6 +503,7 @@ if selected == "🗺 All Stations":
                            annotation_text="±2 min target", annotation_position="top right")
             st.plotly_chart(fig3, use_container_width=True)
 
+        # Model improvement log
         model_log = load_model_log()
         if not model_log.empty:
             st.subheader("Model Improvement over Time")
@@ -512,6 +529,7 @@ if selected == "🗺 All Stations":
             st.plotly_chart(fig_log, use_container_width=True)
             st.caption(f"{len(model_log)} checkpoints logged · every {SAVE_EVERY} trips learned")
 
+        # Delay distribution
         dist = fetch_delay_dist()
         if not dist.empty:
             st.subheader("Network Delay Distribution")
@@ -525,6 +543,7 @@ if selected == "🗺 All Stations":
             fig4.add_vline(x=0, line_dash="dash", line_color="gray")
             st.plotly_chart(fig4, use_container_width=True)
 
+        # Summary table
         st.subheader("Station Summary")
         st.dataframe(
             summary.rename(columns={
@@ -546,7 +565,7 @@ else:
 
     st.header(f"📍 {station_name}")
 
-    kpis = fetch_station_kpis(eva)
+    kpis = fetch_station_kpis(eva, days)
     r = kpis.iloc[0] if not kpis.empty else {}
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -562,6 +581,7 @@ else:
 
     st.divider()
 
+    # Next trains
     st.subheader("Next Trains")
     next_df = fetch_next_trains(eva)
     if next_df.empty:
@@ -605,6 +625,7 @@ else:
 
     col_l, col_r = st.columns(2)
 
+    # Delay by hour
     with col_l:
         st.subheader("Avg Delay by Hour of Day")
         hour_df = fetch_delay_by_hour(eva)
@@ -623,13 +644,16 @@ else:
             fig5.add_hline(y=0, line_color="gray", line_dash="dot")
             st.plotly_chart(fig5, use_container_width=True)
 
+    # Predicted vs Actual scatter
     with col_r:
         st.subheader("Predicted vs Actual Delay")
         preds = fetch_pred_vs_actual(eva)
         if preds.empty:
             st.info("No evaluated predictions yet.")
         else:
-            lim = float(max(preds[["actual", "predicted"]].abs().max().max(), 1))
+            lim = float(max(
+                preds[["actual", "predicted"]].abs().max().max(), 1
+            ))
             lim = min(lim, 60)
             fig6 = px.scatter(
                 preds, x="actual", y="predicted",
@@ -645,6 +669,7 @@ else:
             fig6.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=320)
             st.plotly_chart(fig6, use_container_width=True)
 
+    # Delay distribution for station
     dist = fetch_delay_dist(eva)
     if not dist.empty:
         st.subheader("Delay Distribution")
@@ -658,6 +683,7 @@ else:
         fig7.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=240)
         st.plotly_chart(fig7, use_container_width=True)
 
+    # Recent trips table
     st.subheader("Recent Trips")
     recent = fetch_recent_trips(eva)
     if recent.empty:
