@@ -233,15 +233,20 @@ def fetch_delay_by_hour(station_eva: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
-def fetch_pred_vs_actual(station_eva: str) -> pd.DataFrame:
-    return _qdf("""
+def fetch_pred_vs_actual(station_eva: str, days: int = None) -> pd.DataFrame:
+    date_filter = (
+        "AND predicted_at >= CURRENT_DATE AT TIME ZONE 'Europe/Berlin'" if days == 0
+        else f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days
+        else ""
+    )
+    return _qdf(f"""
         SELECT actual, predicted, predicted_at FROM (
             SELECT DISTINCT ON (train_id, scheduled_arr)
                 ROUND(actual_delay_min::numeric, 1)    AS actual,
                 ROUND(predicted_delay_min::numeric, 1) AS predicted,
                 predicted_at
             FROM predictions
-            WHERE station_eva = %s AND actual_delay_min IS NOT NULL
+            WHERE station_eva = %s AND actual_delay_min IS NOT NULL {date_filter}
             ORDER BY train_id, scheduled_arr, predicted_at DESC
         ) deduped
         ORDER BY predicted_at DESC
@@ -667,7 +672,7 @@ else:
     # Predicted vs Actual scatter
     with col_r:
         st.subheader("Predicted vs Actual Delay")
-        preds = fetch_pred_vs_actual(eva)
+        preds = fetch_pred_vs_actual(eva, days)
         if preds.empty:
             st.info("No evaluated predictions yet.")
         else:
