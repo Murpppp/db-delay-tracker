@@ -152,7 +152,7 @@ def fetch_mae_over_time(days: int = None) -> pd.DataFrame:
         WITH deduped AS (
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
                 predicted_delay_min, actual_delay_min,
-                TO_TIMESTAMP(FLOOR(EXTRACT(EPOCH FROM predicted_at) / 1800) * 1800) AS bucket
+                TO_TIMESTAMP(FLOOR(EXTRACT(EPOCH FROM predicted_at) / 1800) * 1800) AT TIME ZONE 'Europe/Berlin' AS bucket
             FROM predictions
             WHERE actual_delay_min IS NOT NULL {date_filter}
             ORDER BY train_id, station_eva, scheduled_arr, predicted_at DESC
