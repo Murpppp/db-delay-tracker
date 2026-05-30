@@ -77,13 +77,22 @@ Uses River's `HoeffdingAdaptiveTreeRegressor` — an online decision tree that:
 
 ## Setup
 
-### Prerequisites
+> **Important:** There is no pre-trained model included in this repo (`model.pkl` is gitignored).
+> You need to set everything up yourself — API key, database, and an initial training run.
+> The good news: once the pipeline is running, the model trains itself automatically from live data.
 
-- Python 3.10+
-- PostgreSQL (running locally or remotely)
-- Deutsche Bahn Timetables API key — get one at [developers.deutschebahn.com](https://developers.deutschebahn.com)
+### 1. Prerequisites
 
-### Installation
+**Python 3.10+**
+
+**PostgreSQL** — you need a running PostgreSQL instance. Install it from [postgresql.org](https://www.postgresql.org/download/) or use Docker:
+```bash
+docker run --name db-delays -e POSTGRES_PASSWORD=yourpassword -p 5432:5432 -d postgres
+```
+
+**Deutsche Bahn Timetables API key** — register for free at [developers.deutschebahn.com](https://developers.deutschebahn.com), create an application, and subscribe to the **Timetables v1** API. You will get a `Client ID` and an `API Key`.
+
+### 2. Installation
 
 ```bash
 git clone https://github.com/your-username/db-delay-tracker
@@ -91,49 +100,83 @@ cd db-delay-tracker
 pip install -r requirements.txt
 ```
 
-### Configuration
+### 3. Configuration
+
+Copy the example env file and fill in your credentials:
 
 ```bash
 cp .env.example .env
-# Edit .env with your credentials
 ```
 
-### Database Setup
+Edit `.env`:
+```
+DB_CLIENT_ID=your_client_id_from_db_portal
+DB_API_KEY=your_api_key_from_db_portal
+
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=db_delays
+DB_USER=postgres
+DB_PASS=yourpassword
+```
+
+### 4. Create the PostgreSQL database
+
+Connect to PostgreSQL and create the database:
 
 ```sql
 CREATE DATABASE db_delays;
 ```
 
-Tables (`trips` and `predictions`) are created automatically on first pipeline run.
+The tables (`trips` and `predictions`) are created **automatically** the first time `pipeline.py` runs — you don't need to create them manually.
 
-### Running
+### 5. Warm-up training (optional but recommended)
 
-**Step 1 — Train base model** (requires a historical CSV export named `trips_final.csv` or `trips.csv`):
+The model starts completely untrained. Without a warm-up, its first predictions will be close to zero for everything — it needs to accumulate data before it becomes useful.
+
+**Option A — Skip warm-up (cold start):**
+Just go straight to step 6. The pipeline will create a fresh model and start learning from scratch. Predictions will be poor for the first few hours but improve automatically.
+
+**Option B — Warm-up from a historical CSV:**
+If you have a CSV export of historical trips (e.g. from a previous run), you can pre-train the model on it:
+
 ```bash
 python train_base.py
 ```
-Produces `model.pkl` and `model_eval.json`.
 
-**Step 2 — Start the live pipeline:**
+This expects a file called `trips_final.csv` in the project root with columns matching the `trips` table schema. It trains on all rows except the last 3 days (held out for evaluation) and saves `model.pkl` and `model_eval.json`.
+
+After a few days of live data you can export from PostgreSQL and retrain:
+
+```sql
+COPY (SELECT * FROM trips ORDER BY scheduled_arr)
+TO '/absolute/path/to/trips_final.csv' CSV HEADER;
+```
+
+Then re-run `train_base.py`. Each retrain will significantly improve accuracy because the model now sees real route topology and upstream delay patterns from day one.
+
+### 6. Start the live pipeline
+
 ```bash
 python pipeline.py
 ```
 
-**Step 3 — Launch the dashboard** (in a separate terminal):
+This runs forever (Ctrl+C to stop). Every 60 seconds it:
+- Fetches live data from the DB API for all 12 stations
+- Makes delay predictions
+- Stores everything in PostgreSQL
+- Learns from any confirmed arrivals
+- Saves `model.pkl` every 500 learned trips
+
+### 7. Launch the dashboard
+
+In a separate terminal:
+
 ```bash
 streamlit run dashboard.py
 ```
 
-### Retraining on live data
-
-After collecting a few days of live data, export from PostgreSQL and retrain:
-
-```sql
-COPY (SELECT * FROM trips ORDER BY scheduled_arr)
-TO '/path/to/trips_final.csv' CSV HEADER;
-```
-
-Then re-run `train_base.py`. The new model will have seen all the route and upstream delay features from the start.
+Open [http://localhost:8501](http://localhost:8501) in your browser.
 
 ## Project Structure
 
