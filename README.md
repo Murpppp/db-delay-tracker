@@ -197,7 +197,7 @@ db-delay-tracker/
 
 ## Stations Tracked
 
-All in the Stuttgart / Vaihingen–Stuttgart S-Bahn corridor:
+All in the Stuttgart Region:
 
 Vaihingen (Enz) · Sersheim · Sachsenheim · Bietigheim-Bissingen · Asperg ·
 Stuttgart-Zuffenhausen · Stuttgart-Feuerbach · Stuttgart Hbf · Ludwigsburg ·
