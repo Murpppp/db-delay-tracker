@@ -203,6 +203,23 @@ Vaihingen (Enz) · Sersheim · Sachsenheim · Bietigheim-Bissingen · Asperg ·
 Stuttgart-Zuffenhausen · Stuttgart-Feuerbach · Stuttgart Hbf · Ludwigsburg ·
 Stuttgart Stadtmitte · Stuttgart Feuersee · Stuttgart Universität
 
+### Customising stations
+
+You can track any stations in Germany — just edit the `STATIONS` dict in `scraper.py`:
+
+```python
+STATIONS = {
+    "Stuttgart Hbf":   "8000096",
+    "Mannheim Hbf":    "8000244",
+    # add or remove stations here
+}
+```
+
+The number is the station's **EVA/IBNR number**. You can look up any German station's IBNR at:
+[michaeldittrich.de/ibnr/online.php](https://www.michaeldittrich.de/ibnr/online.php)
+
+**API rate limit:** Each station requires 2 API calls per scrape cycle (one for the plan, one for changes). The DB Timetables API free tier allows **60 calls per minute**, so the maximum is **30 stations** when scraping every 60 seconds. Tracking more stations than that will exceed the limit and cause fetch errors.
+
 ## Notes
 
 - IC/ICE trains are excluded (different delay patterns, separate network)
