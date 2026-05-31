@@ -102,11 +102,29 @@ def _qdf(sql: str, params=None) -> pd.DataFrame:
         conn.close()
 
 
+def _event_clause(event: str) -> str:
+    """Filter on predictions/trips by event kind via scheduled_arr presence."""
+    if event == "Arrivals":   return "AND scheduled_arr IS NOT NULL"
+    if event == "Departures": return "AND scheduled_arr IS NULL"
+    return ""
+
+
 @st.cache_data(ttl=60)
-def fetch_overall_kpis(days: int = None) -> pd.DataFrame:
+def fetch_overall_kpis(days: int = None, event: str = "All") -> pd.DataFrame:
     date_filter = (
         "AND predicted_at >= CURRENT_DATE AT TIME ZONE 'Europe/Berlin'" if days == 0
         else f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days
+        else ""
+    )
+    ev = _event_clause(event)
+    trip_count_filter = (
+        "WHERE scheduled_arr IS NOT NULL" if event == "Arrivals"
+        else "WHERE scheduled_dep IS NOT NULL" if event == "Departures"
+        else ""
+    )
+    pred_count_filter = (
+        "WHERE scheduled_arr IS NOT NULL" if event == "Arrivals"
+        else "WHERE scheduled_arr IS NULL" if event == "Departures"
         else ""
     )
     return _qdf(f"""
@@ -114,13 +132,13 @@ def fetch_overall_kpis(days: int = None) -> pd.DataFrame:
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
                 predicted_delay_min, actual_delay_min
             FROM predictions
-            WHERE actual_delay_min IS NOT NULL {date_filter}
+            WHERE actual_delay_min IS NOT NULL {date_filter} {ev}
             ORDER BY train_id, station_eva, scheduled_arr, predicted_at DESC
         )
         SELECT
-            (SELECT COUNT(*) FROM trips)       AS total_trips,
-            (SELECT COUNT(*) FROM predictions) AS total_predictions,
-            COUNT(*)                           AS evaluated,
+            (SELECT COUNT(*) FROM trips {trip_count_filter})       AS total_trips,
+            (SELECT COUNT(*) FROM predictions {pred_count_filter}) AS total_predictions,
+            COUNT(*)                                               AS evaluated,
             ROUND(AVG(ABS(predicted_delay_min - actual_delay_min))::numeric, 2) AS overall_mae,
             ROUND(COUNT(*) FILTER (WHERE ABS(predicted_delay_min - actual_delay_min) <= 2) * 100.0
                   / NULLIF(COUNT(*), 0), 1) AS within_2_pct,
@@ -151,19 +169,20 @@ def fetch_station_summary() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
-def fetch_mae_over_time(days: int = None) -> pd.DataFrame:
+def fetch_mae_over_time(days: int = None, event: str = "All") -> pd.DataFrame:
     date_filter = (
         "AND predicted_at >= CURRENT_DATE AT TIME ZONE 'Europe/Berlin'" if days == 0
         else f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days
         else ""
     )
+    ev = _event_clause(event)
     return _qdf(f"""
         WITH deduped AS (
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
                 predicted_delay_min, actual_delay_min,
                 TO_TIMESTAMP(FLOOR(EXTRACT(EPOCH FROM predicted_at) / 1800) * 1800) AT TIME ZONE 'Europe/Berlin' AS bucket
             FROM predictions
-            WHERE actual_delay_min IS NOT NULL {date_filter}
+            WHERE actual_delay_min IS NOT NULL {date_filter} {ev}
             ORDER BY train_id, station_eva, scheduled_arr, predicted_at DESC
         )
         SELECT
@@ -177,25 +196,40 @@ def fetch_mae_over_time(days: int = None) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
-def fetch_delay_dist(station_eva: str = None) -> pd.DataFrame:
+def fetch_delay_dist(station_eva: str = None, event: str = "All") -> pd.DataFrame:
+    if event == "Arrivals":
+        expr  = "(actual_arr - scheduled_arr)"
+        where = "actual_arr IS NOT NULL AND scheduled_arr IS NOT NULL"
+    elif event == "Departures":
+        expr  = "(actual_dep - scheduled_dep)"
+        where = "actual_dep IS NOT NULL AND scheduled_dep IS NOT NULL"
+    else:
+        expr  = "(COALESCE(actual_arr, actual_dep) - COALESCE(scheduled_arr, scheduled_dep))"
+        where = "COALESCE(actual_arr, actual_dep) IS NOT NULL AND COALESCE(scheduled_arr, scheduled_dep) IS NOT NULL"
     if station_eva:
-        return _qdf("""
-            SELECT ROUND((EXTRACT(EPOCH FROM (actual_arr - scheduled_arr)) / 60)::numeric, 1) AS delay_min
+        return _qdf(f"""
+            SELECT ROUND((EXTRACT(EPOCH FROM {expr}) / 60)::numeric, 1) AS delay_min
             FROM trips
-            WHERE actual_arr IS NOT NULL AND scheduled_arr IS NOT NULL AND station_eva = %s
+            WHERE {where} AND station_eva = %s
         """, (station_eva,))
-    return _qdf("""
-        SELECT ROUND((EXTRACT(EPOCH FROM (actual_arr - scheduled_arr)) / 60)::numeric, 1) AS delay_min
+    return _qdf(f"""
+        SELECT ROUND((EXTRACT(EPOCH FROM {expr}) / 60)::numeric, 1) AS delay_min
         FROM trips
-        WHERE actual_arr IS NOT NULL AND scheduled_arr IS NOT NULL
+        WHERE {where}
     """)
 
 
 @st.cache_data(ttl=60)
-def fetch_station_kpis(station_eva: str, days: int = None) -> pd.DataFrame:
+def fetch_station_kpis(station_eva: str, days: int = None, event: str = "All") -> pd.DataFrame:
     date_filter = (
         "AND predicted_at >= CURRENT_DATE AT TIME ZONE 'Europe/Berlin'" if days == 0
         else f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days
+        else ""
+    )
+    ev = _event_clause(event)
+    trip_ev = (
+        "AND scheduled_arr IS NOT NULL" if event == "Arrivals"
+        else "AND scheduled_dep IS NOT NULL" if event == "Departures"
         else ""
     )
     return _qdf(f"""
@@ -203,43 +237,54 @@ def fetch_station_kpis(station_eva: str, days: int = None) -> pd.DataFrame:
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
                 predicted_delay_min, actual_delay_min
             FROM predictions
-            WHERE station_eva = %s AND actual_delay_min IS NOT NULL {date_filter}
+            WHERE station_eva = %s AND actual_delay_min IS NOT NULL {date_filter} {ev}
             ORDER BY train_id, station_eva, scheduled_arr, predicted_at DESC
         )
         SELECT
-            (SELECT COUNT(*) FROM trips WHERE station_eva = %s) AS total_trips,
+            (SELECT COUNT(*) FROM trips WHERE station_eva = %s {trip_ev}) AS total_trips,
             ROUND(AVG(ABS(predicted_delay_min - actual_delay_min))::numeric, 2) AS mae,
             ROUND(COUNT(*) FILTER (WHERE ABS(predicted_delay_min - actual_delay_min) <= 2) * 100.0
                   / NULLIF(COUNT(*), 0), 1) AS within_2_pct,
             ROUND(COUNT(*) FILTER (WHERE ABS(predicted_delay_min - actual_delay_min) <= 5) * 100.0
                   / NULLIF(COUNT(*), 0), 1) AS within_5_pct,
             (SELECT ROUND(COUNT(*) FILTER (WHERE cancelled) * 100.0 / NULLIF(COUNT(*), 0), 1)
-             FROM trips WHERE station_eva = %s) AS cancel_pct
+             FROM trips WHERE station_eva = %s {trip_ev}) AS cancel_pct
         FROM deduped
     """, (station_eva, station_eva, station_eva))
 
 
 @st.cache_data(ttl=60)
-def fetch_delay_by_hour(station_eva: str) -> pd.DataFrame:
-    return _qdf("""
+def fetch_delay_by_hour(station_eva: str, event: str = "All") -> pd.DataFrame:
+    if event == "Arrivals":
+        sched, actual = "scheduled_arr", "actual_arr"
+        where = "actual_arr IS NOT NULL AND scheduled_arr IS NOT NULL"
+    elif event == "Departures":
+        sched, actual = "scheduled_dep", "actual_dep"
+        where = "actual_dep IS NOT NULL AND scheduled_dep IS NOT NULL"
+    else:
+        sched  = "COALESCE(scheduled_arr, scheduled_dep)"
+        actual = "COALESCE(actual_arr, actual_dep)"
+        where  = f"{actual} IS NOT NULL AND {sched} IS NOT NULL"
+    return _qdf(f"""
         SELECT
-            EXTRACT(HOUR FROM scheduled_arr AT TIME ZONE 'Europe/Berlin')::int AS hour,
-            ROUND(AVG(EXTRACT(EPOCH FROM (actual_arr - scheduled_arr)) / 60)::numeric, 2) AS avg_delay,
+            EXTRACT(HOUR FROM ({sched}) AT TIME ZONE 'Europe/Berlin')::int AS hour,
+            ROUND(AVG(EXTRACT(EPOCH FROM (({actual}) - ({sched}))) / 60)::numeric, 2) AS avg_delay,
             COUNT(*) AS trips
         FROM trips
-        WHERE station_eva = %s AND actual_arr IS NOT NULL AND scheduled_arr IS NOT NULL
+        WHERE station_eva = %s AND {where}
         GROUP BY 1
         ORDER BY 1
     """, (station_eva,))
 
 
 @st.cache_data(ttl=60)
-def fetch_pred_vs_actual(station_eva: str, days: int = None) -> pd.DataFrame:
+def fetch_pred_vs_actual(station_eva: str, days: int = None, event: str = "All") -> pd.DataFrame:
     date_filter = (
         "AND predicted_at >= CURRENT_DATE AT TIME ZONE 'Europe/Berlin'" if days == 0
         else f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days
         else ""
     )
+    ev = _event_clause(event)
     return _qdf(f"""
         SELECT actual, predicted, predicted_at FROM (
             SELECT DISTINCT ON (train_id, scheduled_arr)
@@ -247,7 +292,7 @@ def fetch_pred_vs_actual(station_eva: str, days: int = None) -> pd.DataFrame:
                 ROUND(predicted_delay_min::numeric, 1) AS predicted,
                 predicted_at
             FROM predictions
-            WHERE station_eva = %s AND actual_delay_min IS NOT NULL {date_filter}
+            WHERE station_eva = %s AND actual_delay_min IS NOT NULL {date_filter} {ev}
             ORDER BY train_id, scheduled_arr, predicted_at DESC
         ) deduped
         ORDER BY predicted_at DESC
@@ -256,23 +301,33 @@ def fetch_pred_vs_actual(station_eva: str, days: int = None) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
-def fetch_recent_trips(station_eva: str) -> pd.DataFrame:
-    return _qdf("""
+def fetch_recent_trips(station_eva: str, event: str = "All") -> pd.DataFrame:
+    if event == "Arrivals":
+        sched, actual = "scheduled_arr", "actual_arr"
+        ev_label = "'Arr'"
+        where_ev = "scheduled_arr IS NOT NULL"
+    elif event == "Departures":
+        sched, actual = "scheduled_dep", "actual_dep"
+        ev_label = "'Dep'"
+        where_ev = "scheduled_dep IS NOT NULL"
+    else:
+        sched  = "COALESCE(scheduled_arr, scheduled_dep)"
+        actual = "COALESCE(actual_arr, actual_dep)"
+        ev_label = "CASE WHEN scheduled_arr IS NOT NULL THEN 'Arr' ELSE 'Dep' END"
+        where_ev = f"{sched} IS NOT NULL"
+    return _qdf(f"""
         SELECT
             train_type,
             line,
             direction,
-            CASE WHEN scheduled_arr IS NOT NULL THEN 'Arr' ELSE 'Dep' END AS event_type,
-            TO_CHAR(COALESCE(scheduled_arr, scheduled_dep) AT TIME ZONE 'Europe/Berlin', 'DD.MM HH24:MI') AS sched_time,
-            TO_CHAR(COALESCE(actual_arr,    actual_dep)    AT TIME ZONE 'Europe/Berlin', 'DD.MM HH24:MI') AS actual_time,
-            ROUND((EXTRACT(EPOCH FROM (
-                COALESCE(actual_arr, actual_dep) - COALESCE(scheduled_arr, scheduled_dep)
-            )) / 60)::numeric, 1) AS delay_min,
+            {ev_label} AS event_type,
+            TO_CHAR(({sched})  AT TIME ZONE 'Europe/Berlin', 'DD.MM HH24:MI') AS sched_time,
+            TO_CHAR(({actual}) AT TIME ZONE 'Europe/Berlin', 'DD.MM HH24:MI') AS actual_time,
+            ROUND((EXTRACT(EPOCH FROM (({actual}) - ({sched}))) / 60)::numeric, 1) AS delay_min,
             cancelled
         FROM trips
-        WHERE station_eva = %s
-          AND COALESCE(scheduled_arr, scheduled_dep) IS NOT NULL
-        ORDER BY COALESCE(scheduled_arr, scheduled_dep) DESC
+        WHERE station_eva = %s AND {where_ev}
+        ORDER BY ({sched}) DESC
         LIMIT 100
     """, (station_eva,))
 
@@ -339,18 +394,19 @@ def fetch_next_departures(station_eva: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
-def fetch_live_accuracy(days: int = None) -> pd.DataFrame:
+def fetch_live_accuracy(days: int = None, event: str = "All") -> pd.DataFrame:
     date_filter = (
         "AND predicted_at >= CURRENT_DATE AT TIME ZONE 'Europe/Berlin'" if days == 0
         else f"AND predicted_at >= NOW() - INTERVAL '{days} days'" if days
         else ""
     )
+    ev = _event_clause(event)
     return _qdf(f"""
         WITH deduped AS (
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
                 predicted_delay_min, actual_delay_min
             FROM predictions
-            WHERE actual_delay_min IS NOT NULL {date_filter}
+            WHERE actual_delay_min IS NOT NULL {date_filter} {ev}
             ORDER BY train_id, station_eva, scheduled_arr, predicted_at DESC
         ),
         mean_val AS (
@@ -398,13 +454,14 @@ def load_model_eval() -> dict:
 
 
 @st.cache_data(ttl=60)
-def fetch_mae_by_station() -> pd.DataFrame:
-    return _qdf("""
+def fetch_mae_by_station(event: str = "All") -> pd.DataFrame:
+    ev = _event_clause(event)
+    return _qdf(f"""
         WITH deduped AS (
             SELECT DISTINCT ON (train_id, station_eva, scheduled_arr)
                 station_eva, predicted_delay_min, actual_delay_min
             FROM predictions
-            WHERE actual_delay_min IS NOT NULL
+            WHERE actual_delay_min IS NOT NULL {ev}
             ORDER BY train_id, station_eva, scheduled_arr, predicted_at DESC
         )
         SELECT
@@ -430,6 +487,13 @@ with st.sidebar:
         index=1,
     )
     days = {"Today": 0, "Last 7 days": 7, "Last month": 30, "All time": None}[days_filter]
+
+    event = st.radio(
+        "Event type",
+        ["All", "Arrivals", "Departures"],
+        index=0,
+        help="Arrivals = through-trains; Departures = origin trains (no arrival event).",
+    )
     st.divider()
 
     options = ["🗺 All Stations"] + list(STATIONS.keys())
@@ -445,7 +509,7 @@ with st.sidebar:
 if selected == "🗺 All Stations":
     st.header("Overall Network Overview")
 
-    kpis = fetch_overall_kpis(days)
+    kpis = fetch_overall_kpis(days, event)
     r = kpis.iloc[0] if not kpis.empty else {}
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -464,7 +528,7 @@ if selected == "🗺 All Stations":
     # Model accuracy comparison
     with st.expander("Model Accuracy — Baseline vs Live", expanded=True):
         ev = load_model_eval()
-        live = fetch_live_accuracy(days)
+        live = fetch_live_accuracy(days, event)
         lr = live.iloc[0] if not live.empty else {}
 
         col_b, col_l, col_d = st.columns(3)
@@ -513,7 +577,14 @@ if selected == "🗺 All Stations":
 """)
 
     summary = fetch_station_summary()
-    mae_by_station = fetch_mae_by_station()
+    if not summary.empty:
+        a  = summary["avg_delay_arr"].astype(float).fillna(0)
+        b  = summary["avg_delay_dep"].astype(float).fillna(0)
+        wa = summary["with_actual_arr"].astype(float)
+        wb = summary["with_actual_dep"].astype(float)
+        total = (wa + wb).replace(0, pd.NA)
+        summary["avg_delay_all"] = (a * wa + b * wb) / total
+    mae_by_station = fetch_mae_by_station(event)
 
     if summary.empty:
         st.info("No trip data yet — start pipeline.py to collect live data.", icon="ℹ️")
@@ -521,26 +592,30 @@ if selected == "🗺 All Stations":
         col_l, col_r = st.columns(2)
 
         with col_l:
-            head_l, head_m, _ = st.columns([2, 2, 2])
-            head_l.subheader("Avg Delay per Station")
-            metric_choice = head_m.radio(
-                "Show", ["Arrival", "Departure"],
-                horizontal=True, label_visibility="collapsed",
-                key="avg_delay_metric",
+            st.subheader("Avg Delay per Station")
+            col_name = (
+                "avg_delay_arr" if event == "Arrivals"
+                else "avg_delay_dep" if event == "Departures"
+                else "avg_delay_all"
             )
-            col_name = "avg_delay_arr" if metric_choice == "Arrival" else "avg_delay_dep"
+            metric_label = (
+                "Arrival" if event == "Arrivals"
+                else "Departure" if event == "Departures"
+                else "Overall"
+            )
             chart_df = summary.dropna(subset=[col_name]).sort_values(col_name)
             x_max = max(
                 float(summary["avg_delay_arr"].max(skipna=True) or 0),
                 float(summary["avg_delay_dep"].max(skipna=True) or 0),
+                float(summary.get("avg_delay_all", pd.Series([0])).max(skipna=True) or 0),
             )
             fig = px.bar(
                 chart_df,
                 x=col_name, y="station_name", orientation="h",
                 color="station_name",
                 color_discrete_map=STATION_COLORS,
-                labels={col_name: f"Avg {metric_choice} Delay (min)", "station_name": ""},
-                range_x=[0, x_max * 1.05],
+                labels={col_name: f"Avg {metric_label} Delay (min)", "station_name": ""},
+                range_x=[0, x_max * 1.05] if x_max > 0 else None,
             )
             fig.update_layout(showlegend=False, margin=dict(l=0,r=10,t=0,b=0), height=400)
             st.plotly_chart(fig, use_container_width=True)
@@ -563,7 +638,7 @@ if selected == "🗺 All Stations":
                 st.info("No evaluated predictions yet.")
 
         # MAE over time
-        mae_df = fetch_mae_over_time(days)
+        mae_df = fetch_mae_over_time(days, event)
         if not mae_df.empty:
             st.subheader("Model MAE over Time")
             fig3 = px.line(
@@ -605,7 +680,7 @@ if selected == "🗺 All Stations":
             st.caption(f"{len(model_log)} checkpoints logged · every {SAVE_EVERY} trips learned")
 
         # Delay distribution
-        dist = fetch_delay_dist()
+        dist = fetch_delay_dist(event=event)
         if not dist.empty:
             st.subheader("Network Delay Distribution")
             clipped = dist[(dist["delay_min"] >= -10) & (dist["delay_min"] <= 60)]
@@ -645,7 +720,7 @@ else:
 
     st.header(f"📍 {station_name}")
 
-    kpis = fetch_station_kpis(eva, days)
+    kpis = fetch_station_kpis(eva, days, event)
     r = kpis.iloc[0] if not kpis.empty else {}
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -720,7 +795,7 @@ else:
     # Delay by hour
     with col_l:
         st.subheader("Avg Delay by Hour of Day")
-        hour_df = fetch_delay_by_hour(eva)
+        hour_df = fetch_delay_by_hour(eva, event)
         if hour_df.empty:
             st.info("No arrival data yet.")
         else:
@@ -739,7 +814,7 @@ else:
     # Predicted vs Actual scatter
     with col_r:
         st.subheader("Predicted vs Actual Delay")
-        preds = fetch_pred_vs_actual(eva, days)
+        preds = fetch_pred_vs_actual(eva, days, event)
         if preds.empty:
             st.info("No evaluated predictions yet.")
         else:
@@ -762,7 +837,7 @@ else:
             st.plotly_chart(fig6, use_container_width=True)
 
     # Delay distribution for station
-    dist = fetch_delay_dist(eva)
+    dist = fetch_delay_dist(eva, event)
     if not dist.empty:
         st.subheader("Delay Distribution")
         clipped = dist[(dist["delay_min"] >= -10) & (dist["delay_min"] <= 60)]
@@ -777,7 +852,7 @@ else:
 
     # Recent trips table
     st.subheader("Recent Trips")
-    recent = fetch_recent_trips(eva)
+    recent = fetch_recent_trips(eva, event)
     if recent.empty:
         st.info("No trips scraped yet for this station.")
     else:

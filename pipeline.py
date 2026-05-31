@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     train_id            TEXT        NOT NULL,
     station_eva         TEXT        NOT NULL,
     scheduled_arr       TIMESTAMPTZ,
+    scheduled_dep       TIMESTAMPTZ,
     predicted_delay_min FLOAT,
     actual_delay_min    FLOAT,
     predicted_at        TIMESTAMPTZ DEFAULT NOW()
@@ -106,8 +107,8 @@ ON CONFLICT (train_id, station_eva, COALESCE(scheduled_dep, scheduled_arr)) DO U
 
 _INSERT_PRED = """
 INSERT INTO predictions
-    (train_id, station_eva, scheduled_arr, predicted_delay_min, actual_delay_min)
-VALUES (%s, %s, %s, %s, %s);
+    (train_id, station_eva, scheduled_arr, scheduled_dep, predicted_delay_min, actual_delay_min)
+VALUES (%s, %s, %s, %s, %s, %s);
 """
 
 
@@ -118,6 +119,7 @@ def _setup_tables(conn) -> None:
         cur.execute(_CREATE_TRIPS)
         cur.execute(_CREATE_PREDICTIONS)
         cur.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS ppth TEXT;")
+        cur.execute("ALTER TABLE predictions ADD COLUMN IF NOT EXISTS scheduled_dep TIMESTAMPTZ;")
     conn.commit()
     log.info("DB tables ready.")
 
@@ -246,14 +248,6 @@ def main() -> None:
                             continue
 
                         row["upstream_delay_min"] = train_delays.get(row["train_id"])
-                        features = build_features(row)
-                        raw_pred   = model.predict_one(features)
-                        pred       = max(-30.0, min(120.0, raw_pred))
-                        sched_ref  = row["scheduled_arr"] if row["scheduled_arr"] is not None else row["scheduled_dep"]
-                        actual_ref = row["actual_arr"]    if row["actual_arr"]    is not None else row["actual_dep"]
-                        delay      = compute_delay_min(sched_ref, actual_ref)
-                        if delay is not None:
-                            train_delays[row["train_id"]] = delay
 
                         with conn.cursor() as cur:
                             cur.execute(_INSERT_TRIP, (
@@ -266,34 +260,52 @@ def main() -> None:
                             ))
                         conn.commit()
 
-                        with conn.cursor() as cur:
-                            cur.execute(_INSERT_PRED, (
-                                row["train_id"], row["station_eva"],
-                                row["scheduled_arr"], pred, delay,
-                            ))
-                        conn.commit()
+                        # Emit up to two predict/learn cycles: one for arrival, one for departure.
+                        events = []
+                        if row["scheduled_arr"] is not None:
+                            events.append(("arr", row["scheduled_arr"], row["actual_arr"]))
+                        if row["scheduled_dep"] is not None:
+                            events.append(("dep", row["scheduled_dep"], row["actual_dep"]))
 
-                        if delay is not None and -120.0 <= delay <= 120.0:
-                            key = (row["train_id"], eva, str(sched_ref))
-                            if key not in learned_keys:
-                                model.learn_one(features, delay)
-                                learned_keys.add(key)
-                                trips_learned += 1
-                                err = abs(delay - pred)
-                                errors_100.append(err)
-                                errors_500.append(err)
-                                mae_100 = sum(errors_100) / len(errors_100)
+                        for event_kind, sched_ref, actual_ref in events:
+                            features = build_features(row, event_kind=event_kind)
+                            raw_pred = model.predict_one(features)
+                            pred     = max(-30.0, min(120.0, raw_pred))
+                            delay    = compute_delay_min(sched_ref, actual_ref)
+                            if delay is not None:
+                                train_delays[row["train_id"]] = delay
 
-                                log.info(
-                                    f"  learn #{trips_learned:,} | "
-                                    f"actual={delay:+.1f}min pred={pred:+.1f}min | "
-                                    f"MAE(100)={mae_100:.2f}min"
-                                )
+                            sched_arr_col = row["scheduled_arr"] if event_kind == "arr" else None
+                            sched_dep_col = row["scheduled_dep"] if event_kind == "dep" else None
 
-                                if trips_learned % SAVE_EVERY == 0:
-                                    _save_model(model)
-                                    _append_log(trips_learned, errors_100, errors_500)
-                                    _log_summary(trips_learned, errors_100, errors_500)
+                            with conn.cursor() as cur:
+                                cur.execute(_INSERT_PRED, (
+                                    row["train_id"], row["station_eva"],
+                                    sched_arr_col, sched_dep_col, pred, delay,
+                                ))
+                            conn.commit()
+
+                            if delay is not None and -120.0 <= delay <= 120.0:
+                                key = (row["train_id"], eva, event_kind, str(sched_ref))
+                                if key not in learned_keys:
+                                    model.learn_one(features, delay)
+                                    learned_keys.add(key)
+                                    trips_learned += 1
+                                    err = abs(delay - pred)
+                                    errors_100.append(err)
+                                    errors_500.append(err)
+                                    mae_100 = sum(errors_100) / len(errors_100)
+
+                                    log.info(
+                                        f"  learn #{trips_learned:,} ({event_kind}) | "
+                                        f"actual={delay:+.1f}min pred={pred:+.1f}min | "
+                                        f"MAE(100)={mae_100:.2f}min"
+                                    )
+
+                                    if trips_learned % SAVE_EVERY == 0:
+                                        _save_model(model)
+                                        _append_log(trips_learned, errors_100, errors_500)
+                                        _log_summary(trips_learned, errors_100, errors_500)
 
                         station_count += 1
                         cycle_count   += 1

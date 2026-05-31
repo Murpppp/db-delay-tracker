@@ -32,25 +32,31 @@ def _is_null(val) -> bool:
         return False
 
 
-def build_features(row: dict) -> dict:
+def build_features(row: dict, event_kind: str = "arr") -> dict:
     sched_arr  = row.get("scheduled_arr")
     actual_arr = row.get("actual_arr")
     sched_dep  = row.get("scheduled_dep")
     actual_dep = row.get("actual_dep")
 
-    arr_missing = int(_is_null(sched_arr) or _is_null(actual_arr))
-    is_origin   = int(_is_null(sched_arr))  # train starts here, no scheduled arrival
+    arr_missing  = int(_is_null(sched_arr) or _is_null(actual_arr))
+    is_origin    = int(_is_null(sched_arr))   # train starts here, no scheduled arrival
+    is_departure = 1 if event_kind == "dep" else 0
 
-    # Real-time signal: how late is this train already at departure?
-    dep_delay = compute_delay_min(sched_dep, actual_dep)
-    if dep_delay is not None and -120.0 <= dep_delay <= 120.0:
-        dep_delay_min   = dep_delay
-        dep_delay_known = 1
-    else:
+    if event_kind == "dep":
+        # Predicting this station's departure — dep_delay would equal the target at learn time.
         dep_delay_min   = 0
         dep_delay_known = 0
-
-    ref = _to_local(sched_arr if not _is_null(sched_arr) else sched_dep)
+        ref = _to_local(sched_dep)
+    else:
+        # Real-time signal: how late is this train already at departure?
+        dep_delay = compute_delay_min(sched_dep, actual_dep)
+        if dep_delay is not None and -120.0 <= dep_delay <= 120.0:
+            dep_delay_min   = dep_delay
+            dep_delay_known = 1
+        else:
+            dep_delay_min   = 0
+            dep_delay_known = 0
+        ref = _to_local(sched_arr if not _is_null(sched_arr) else sched_dep)
     if ref is not None:
         hour     = ref.hour
         minute   = ref.minute
@@ -137,6 +143,7 @@ def build_features(row: dict) -> dict:
         "line_missing":           line_missing,
         "arr_missing":            arr_missing,
         "is_origin":              is_origin,
+        "is_departure":           is_departure,
         "cancelled":              cancelled_int,
         "direction":              direction_hash,
         "minutes_since_midnight": minutes_since_midnight,
