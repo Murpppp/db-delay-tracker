@@ -135,17 +135,18 @@ def fetch_station_summary() -> pd.DataFrame:
     df = _qdf("""
         SELECT
             station_eva,
-            station_name,
-            COUNT(*)                                                                    AS trips,
-            ROUND(AVG(EXTRACT(EPOCH FROM (actual_arr - scheduled_arr)) / 60)::numeric, 2) AS avg_delay_min,
-            ROUND(COUNT(*) FILTER (WHERE cancelled) * 100.0 / NULLIF(COUNT(*), 0)::numeric, 1) AS cancel_pct,
-            COUNT(*) FILTER (WHERE actual_arr IS NOT NULL)                              AS with_actual
+            COUNT(*)                                                                              AS trips,
+            ROUND(AVG(EXTRACT(EPOCH FROM (actual_arr - scheduled_arr)) / 60)::numeric, 2)         AS avg_delay_arr,
+            ROUND(AVG(EXTRACT(EPOCH FROM (actual_dep - scheduled_dep)) / 60)::numeric, 2)         AS avg_delay_dep,
+            ROUND(COUNT(*) FILTER (WHERE cancelled) * 100.0 / NULLIF(COUNT(*), 0)::numeric, 1)    AS cancel_pct,
+            COUNT(*) FILTER (WHERE actual_arr IS NOT NULL)                                        AS with_actual_arr,
+            COUNT(*) FILTER (WHERE actual_dep IS NOT NULL)                                        AS with_actual_dep
         FROM trips
-        GROUP BY station_eva, station_name
-        ORDER BY avg_delay_min DESC NULLS LAST
+        GROUP BY station_eva
+        ORDER BY avg_delay_arr DESC NULLS LAST
     """)
     if not df.empty:
-        df["station_name"] = df["station_name"].fillna(df["station_eva"].map(EVA_TO_NAME))
+        df["station_name"] = df["station_eva"].map(EVA_TO_NAME).fillna(df["station_eva"])
     return df
 
 
@@ -261,27 +262,31 @@ def fetch_recent_trips(station_eva: str) -> pd.DataFrame:
             train_type,
             line,
             direction,
-            TO_CHAR(scheduled_arr AT TIME ZONE 'Europe/Berlin', 'DD.MM HH24:MI') AS sched_arr,
-            TO_CHAR(actual_arr    AT TIME ZONE 'Europe/Berlin', 'DD.MM HH24:MI') AS actual_arr,
-            ROUND((EXTRACT(EPOCH FROM (actual_arr - scheduled_arr)) / 60)::numeric, 1) AS delay_min,
+            CASE WHEN scheduled_arr IS NOT NULL THEN 'Arr' ELSE 'Dep' END AS event_type,
+            TO_CHAR(COALESCE(scheduled_arr, scheduled_dep) AT TIME ZONE 'Europe/Berlin', 'DD.MM HH24:MI') AS sched_time,
+            TO_CHAR(COALESCE(actual_arr,    actual_dep)    AT TIME ZONE 'Europe/Berlin', 'DD.MM HH24:MI') AS actual_time,
+            ROUND((EXTRACT(EPOCH FROM (
+                COALESCE(actual_arr, actual_dep) - COALESCE(scheduled_arr, scheduled_dep)
+            )) / 60)::numeric, 1) AS delay_min,
             cancelled
         FROM trips
         WHERE station_eva = %s
-        ORDER BY scheduled_arr DESC
+          AND COALESCE(scheduled_arr, scheduled_dep) IS NOT NULL
+        ORDER BY COALESCE(scheduled_arr, scheduled_dep) DESC
         LIMIT 100
     """, (station_eva,))
 
 
 @st.cache_data(ttl=60)
-def fetch_next_trains(station_eva: str) -> pd.DataFrame:
+def fetch_next_arrivals(station_eva: str) -> pd.DataFrame:
     return _qdf("""
         SELECT * FROM (
             SELECT DISTINCT ON (t.train_id, t.scheduled_arr)
                 t.train_type,
                 COALESCE(t.line, '—')      AS line,
                 COALESCE(t.direction, '—') AS direction,
-                TO_CHAR(t.scheduled_arr AT TIME ZONE 'Europe/Berlin', 'HH24:MI') AS sched_arr,
-                t.scheduled_arr            AS sched_arr_raw,
+                TO_CHAR(t.scheduled_arr AT TIME ZONE 'Europe/Berlin', 'HH24:MI') AS sched_time,
+                t.scheduled_arr            AS sched_raw,
                 ROUND(p.predicted_delay_min::numeric, 1)                          AS predicted_delay_min
             FROM trips t
             LEFT JOIN LATERAL (
@@ -292,11 +297,43 @@ def fetch_next_trains(station_eva: str) -> pd.DataFrame:
                 LIMIT 1
             ) p ON true
             WHERE t.station_eva = %s
+              AND t.scheduled_arr IS NOT NULL
               AND t.scheduled_arr > NOW()
               AND t.cancelled = false
             ORDER BY t.train_id, t.scheduled_arr, t.scraped_at DESC
         ) deduped
-        ORDER BY sched_arr_raw ASC
+        ORDER BY sched_raw ASC
+        LIMIT 15
+    """, (station_eva,))
+
+
+@st.cache_data(ttl=60)
+def fetch_next_departures(station_eva: str) -> pd.DataFrame:
+    return _qdf("""
+        SELECT * FROM (
+            SELECT DISTINCT ON (t.train_id, t.scheduled_dep)
+                t.train_type,
+                COALESCE(t.line, '—')      AS line,
+                COALESCE(t.direction, '—') AS direction,
+                TO_CHAR(t.scheduled_dep AT TIME ZONE 'Europe/Berlin', 'HH24:MI') AS sched_time,
+                t.scheduled_dep            AS sched_raw,
+                ROUND(p.predicted_delay_min::numeric, 1)                          AS predicted_delay_min
+            FROM trips t
+            LEFT JOIN LATERAL (
+                SELECT predicted_delay_min
+                FROM predictions
+                WHERE train_id = t.train_id AND station_eva = t.station_eva
+                ORDER BY predicted_at DESC
+                LIMIT 1
+            ) p ON true
+            WHERE t.station_eva = %s
+              AND t.scheduled_arr IS NULL
+              AND t.scheduled_dep IS NOT NULL
+              AND t.scheduled_dep > NOW()
+              AND t.cancelled = false
+            ORDER BY t.train_id, t.scheduled_dep, t.scraped_at DESC
+        ) deduped
+        ORDER BY sched_raw ASC
         LIMIT 15
     """, (station_eva,))
 
@@ -484,15 +521,28 @@ if selected == "🗺 All Stations":
         col_l, col_r = st.columns(2)
 
         with col_l:
-            st.subheader("Avg Delay per Station")
+            head_l, head_m, _ = st.columns([2, 2, 2])
+            head_l.subheader("Avg Delay per Station")
+            metric_choice = head_m.radio(
+                "Show", ["Arrival", "Departure"],
+                horizontal=True, label_visibility="collapsed",
+                key="avg_delay_metric",
+            )
+            col_name = "avg_delay_arr" if metric_choice == "Arrival" else "avg_delay_dep"
+            chart_df = summary.dropna(subset=[col_name]).sort_values(col_name)
+            x_max = max(
+                float(summary["avg_delay_arr"].max(skipna=True) or 0),
+                float(summary["avg_delay_dep"].max(skipna=True) or 0),
+            )
             fig = px.bar(
-                summary.dropna(subset=["avg_delay_min"]).sort_values("avg_delay_min"),
-                x="avg_delay_min", y="station_name", orientation="h",
+                chart_df,
+                x=col_name, y="station_name", orientation="h",
                 color="station_name",
                 color_discrete_map=STATION_COLORS,
-                labels={"avg_delay_min": "Avg Delay (min)", "station_name": ""},
+                labels={col_name: f"Avg {metric_choice} Delay (min)", "station_name": ""},
+                range_x=[0, x_max * 1.05],
             )
-            fig.update_layout(showlegend=False, margin=dict(l=0,r=10,t=0,b=0), height=380)
+            fig.update_layout(showlegend=False, margin=dict(l=0,r=10,t=0,b=0), height=400)
             st.plotly_chart(fig, use_container_width=True)
 
         with col_r:
@@ -507,7 +557,7 @@ if selected == "🗺 All Stations":
                     labels={"mae": "MAE (min)", "name": ""},
                     hover_data=["evaluated"],
                 )
-                fig2.update_layout(showlegend=False, margin=dict(l=0,r=10,t=0,b=0), height=380)
+                fig2.update_layout(showlegend=False, margin=dict(l=0,r=10,t=0,b=0), height=400)
                 st.plotly_chart(fig2, use_container_width=True)
             else:
                 st.info("No evaluated predictions yet.")
@@ -572,12 +622,17 @@ if selected == "🗺 All Stations":
         st.subheader("Station Summary")
         st.dataframe(
             summary.rename(columns={
-                "station_name":  "Station",
-                "trips":         "Total Trips",
-                "avg_delay_min": "Avg Delay (min)",
-                "cancel_pct":    "Cancelled (%)",
-                "with_actual":   "With Actual Arr",
-            })[["Station", "Total Trips", "Avg Delay (min)", "Cancelled (%)", "With Actual Arr"]],
+                "station_name":    "Station",
+                "trips":           "Total Trips",
+                "avg_delay_arr":   "Avg Arr Delay (min)",
+                "avg_delay_dep":   "Avg Dep Delay (min)",
+                "cancel_pct":      "Cancelled (%)",
+                "with_actual_arr": "With Actual Arr",
+                "with_actual_dep": "With Actual Dep",
+            })[["Station", "Total Trips",
+                "Avg Arr Delay (min)", "Avg Dep Delay (min)",
+                "Cancelled (%)",
+                "With Actual Arr", "With Actual Dep"]],
             use_container_width=True,
             hide_index=True,
         )
@@ -608,8 +663,10 @@ else:
 
     # Next trains
     st.subheader("Next Trains")
-    next_df = fetch_next_trains(eva)
-    if next_df.empty:
+    arrivals_df   = fetch_next_arrivals(eva)
+    departures_df = fetch_next_departures(eva)
+
+    if arrivals_df.empty and departures_df.empty:
         st.info("No upcoming trains found — pipeline may not be running yet.")
     else:
         def _delay_label(val):
@@ -622,29 +679,39 @@ else:
                 return f"🟡 +{val:.1f} min"
             return f"🔴 +{val:.1f} min"
 
-        def _pred_arrival(row):
-            if row["sched_arr_raw"] is None:
+        def _pred_time(row):
+            if row["sched_raw"] is None:
                 return "—"
             delay = row["predicted_delay_min"]
             if delay is None or (isinstance(delay, float) and pd.isna(delay)):
                 return "—"
             from datetime import timedelta
             import pandas as _pd
-            arr = _pd.Timestamp(row["sched_arr_raw"])
-            pred = arr + timedelta(minutes=float(delay))
+            base = _pd.Timestamp(row["sched_raw"])
+            pred = base + timedelta(minutes=float(delay))
             return pred.tz_convert("Europe/Berlin").strftime("%H:%M")
 
-        display = next_df.copy()
-        display["Predicted Delay"] = display["predicted_delay_min"].apply(_delay_label)
-        display["Pred. Arrival"]   = display.apply(_pred_arrival, axis=1)
-        display = display.rename(columns={
-            "train_type": "Type",
-            "line":       "Line",
-            "direction":  "Direction",
-            "sched_arr":  "Scheduled",
-        })[["Type", "Line", "Direction", "Scheduled", "Pred. Arrival", "Predicted Delay"]]
+        def _render(df: pd.DataFrame, pred_label: str) -> pd.DataFrame:
+            out = df.copy()
+            out["Predicted Delay"] = out["predicted_delay_min"].apply(_delay_label)
+            out[pred_label]        = out.apply(_pred_time, axis=1)
+            out = out.rename(columns={
+                "train_type": "Type",
+                "line":       "Line",
+                "direction":  "Direction",
+                "sched_time": "Scheduled",
+            })
+            return out[["Type", "Line", "Direction", "Scheduled", pred_label, "Predicted Delay"]]
 
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        if not arrivals_df.empty:
+            st.markdown("**Arrivals**")
+            st.dataframe(_render(arrivals_df, "Pred. Arrival"),
+                         use_container_width=True, hide_index=True)
+
+        if not departures_df.empty:
+            st.markdown("**Departures** *(origin trains — no arrival at this station)*")
+            st.dataframe(_render(departures_df, "Pred. Departure"),
+                         use_container_width=True, hide_index=True)
 
     st.divider()
 
@@ -714,15 +781,17 @@ else:
     if recent.empty:
         st.info("No trips scraped yet for this station.")
     else:
+        st.caption("Event = Arr (arrival delay) for through-trains, Dep (departure delay) for trains originating here.")
         st.dataframe(
             recent.rename(columns={
-                "train_type": "Type",
-                "line":       "Line",
-                "direction":  "Direction",
-                "sched_arr":  "Scheduled Arr",
-                "actual_arr": "Actual Arr",
-                "delay_min":  "Delay (min)",
-                "cancelled":  "Cancelled",
+                "train_type":  "Type",
+                "line":        "Line",
+                "direction":   "Direction",
+                "event_type":  "Event",
+                "sched_time":  "Scheduled",
+                "actual_time": "Actual",
+                "delay_min":   "Delay (min)",
+                "cancelled":   "Cancelled",
             }),
             use_container_width=True,
             hide_index=True,
