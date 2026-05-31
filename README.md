@@ -1,6 +1,6 @@
 # DB Delay Tracker
 
-A real-time Deutsche Bahn train delay prediction system using online machine learning. Scrapes live data from the DB Timetables API every 60 seconds, predicts arrival delays for 12 stations in the Stuttgart S-Bahn network, and displays everything on a live Streamlit dashboard.
+A real-time Deutsche Bahn train delay prediction system using online machine learning. Scrapes live data from the DB Timetables API every 60 seconds, predicts both **arrival and departure** delays for 12 stations in the Stuttgart S-Bahn network, and displays everything on a live Streamlit dashboard with a global Arrivals / Departures / All filter.
 
 ## Screenshots
 
@@ -49,15 +49,16 @@ dashboard.py         Streamlit live dashboard (auto-refresh 60s)
 | Data source | Deutsche Bahn Timetables API v1 |
 | Language | Python 3.10+ |
 
-## Features (29 total)
+## Features (30 total)
 
-The model uses 29 features across 5 groups:
+The model uses 30 features across 6 groups:
 
 - **Time** — hour, weekday, minutes since midnight
 - **Cyclical encodings** — sin/cos for hour, minute, weekday, week, month (avoids discontinuities at midnight/Monday/January)
-- **Real-time signal** — departure delay at current station (`dep_delay_min`, `dep_delay_known`)
+- **Real-time signal** — departure delay at current station (`dep_delay_min`, `dep_delay_known`) — zeroed when predicting a departure event to prevent target leakage
 - **Route topology** — route length, position in route (0–1), route identity hash (from `ppth`)
 - **Upstream propagation** — last confirmed delay for this train at any prior station (`upstream_delay_min`)
+- **Event kind** — `is_origin` (train starts at this station) and `is_departure` (this prediction is for a departure event, not an arrival)
 
 ## Model
 
@@ -163,10 +164,10 @@ python pipeline.py
 
 This runs forever (Ctrl+C to stop). Every 60 seconds it:
 - Fetches live data from the DB API for all 12 stations
-- Makes delay predictions
-- Stores everything in PostgreSQL
-- Learns from any confirmed arrivals
-- Saves `model.pkl` every 500 learned trips
+- For each scheduled stop, makes up to **two** predictions — one for the arrival event and one for the departure event
+- Stores everything in PostgreSQL (arrival rows tagged via `scheduled_arr`, departure rows via `scheduled_dep`)
+- Learns independently from any confirmed arrivals and departures
+- Saves `model.pkl` every 500 learned events
 
 ### 7. Launch the dashboard
 
@@ -222,5 +223,7 @@ The number is the station's **EVA/IBNR number**. You can look up any German stat
 ## Notes
 
 - IC/ICE trains are excluded (different delay patterns, separate network)
-- The predictions table keeps all raw predictions (one per scrape cycle per trip); the dashboard deduplicates with `DISTINCT ON` for accurate metrics
-- `learned_keys` prevents the same trip arrival from being learned twice across cycles
+- The predictions table keeps all raw predictions (up to two per scrape cycle per trip — one arrival, one departure); the dashboard deduplicates with `DISTINCT ON` for accurate metrics
+- Event kind is encoded in the `predictions` row by which scheduled-time column is filled: arrival rows have `scheduled_arr` set, departure rows have `scheduled_dep` set
+- `learned_keys` is keyed on `(train_id, station_eva, event_kind, scheduled_ref)`, so the same arrival and the same departure are each learned at most once across cycles
+- Dashboard has a global Arrivals / Departures / All filter in the sidebar that drives every chart and KPI consistently
