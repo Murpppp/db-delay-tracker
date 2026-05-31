@@ -10,7 +10,7 @@ Every 60 seconds:
   - Upserts trips into PostgreSQL
   - Predicts delay with the River model
   - Stores predictions in PostgreSQL
-  - Learns when actual_arr is known
+  - Learns when actual arrival (or departure for origin trains) is known
   - Saves model.pkl every 500 learn_one() calls
 """
 
@@ -247,9 +247,11 @@ def main() -> None:
 
                         row["upstream_delay_min"] = train_delays.get(row["train_id"])
                         features = build_features(row)
-                        raw_pred = model.predict_one(features)
-                        pred     = max(-30.0, min(120.0, raw_pred))
-                        delay    = compute_delay_min(row["scheduled_arr"], row["actual_arr"])
+                        raw_pred   = model.predict_one(features)
+                        pred       = max(-30.0, min(120.0, raw_pred))
+                        sched_ref  = row["scheduled_arr"] if row["scheduled_arr"] is not None else row["scheduled_dep"]
+                        actual_ref = row["actual_arr"]    if row["actual_arr"]    is not None else row["actual_dep"]
+                        delay      = compute_delay_min(sched_ref, actual_ref)
                         if delay is not None:
                             train_delays[row["train_id"]] = delay
 
@@ -272,7 +274,7 @@ def main() -> None:
                         conn.commit()
 
                         if delay is not None and -120.0 <= delay <= 120.0:
-                            key = (row["train_id"], eva, str(row["scheduled_arr"]))
+                            key = (row["train_id"], eva, str(sched_ref))
                             if key not in learned_keys:
                                 model.learn_one(features, delay)
                                 learned_keys.add(key)

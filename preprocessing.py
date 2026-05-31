@@ -39,6 +39,7 @@ def build_features(row: dict) -> dict:
     actual_dep = row.get("actual_dep")
 
     arr_missing = int(_is_null(sched_arr) or _is_null(actual_arr))
+    is_origin   = int(_is_null(sched_arr))  # train starts here, no scheduled arrival
 
     # Real-time signal: how late is this train already at departure?
     dep_delay = compute_delay_min(sched_dep, actual_dep)
@@ -135,6 +136,7 @@ def build_features(row: dict) -> dict:
         "line":                   line_hash,
         "line_missing":           line_missing,
         "arr_missing":            arr_missing,
+        "is_origin":              is_origin,
         "cancelled":              cancelled_int,
         "direction":              direction_hash,
         "minutes_since_midnight": minutes_since_midnight,
